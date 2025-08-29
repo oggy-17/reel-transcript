@@ -6,15 +6,19 @@ import tempfile
 from typing import List, Optional, Dict, Any
 from urllib.parse import urlsplit, urlunsplit
 
-from fastapi import FastAPI, HTTPException, Form, UploadFile, File
+from fastapi import FastAPI, HTTPException, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 import uvicorn
 import yt_dlp
 from faster_whisper import WhisperModel
 
-# ---------- URL cleaning & validation ----------
+# ----------------- config -----------------
+# Set this env var locally to auto-use your browser cookies (no uploads needed):
+#   COOKIES_BROWSER=chrome  (or edge / firefox)
+LOCAL_COOKIES_BROWSER = os.environ.get("COOKIES_BROWSER", "").strip().lower()
 
+# ---------- URL cleaning & validation ----------
 INSTAGRAM_RE = re.compile(
     r"^https?://(www\.)?instagram\.com/reels?/[A-Za-z0-9_\-]+/?$",
     re.IGNORECASE,
@@ -37,7 +41,6 @@ def _clean_instagram_reel_url(url: str) -> str:
     return urlunsplit((parsed.scheme or "https", parsed.netloc or "www.instagram.com", cleaned_path, "", ""))
 
 # ---------- Whisper model (lazy) ----------
-
 _MODEL = None
 def get_model(model_size: str = "small", compute_type: str = "int8") -> WhisperModel:
     global _MODEL
@@ -46,7 +49,6 @@ def get_model(model_size: str = "small", compute_type: str = "int8") -> WhisperM
     return _MODEL
 
 # ---------- Core functions ----------
-
 def download_audio(url: str, cookies_path: Optional[str] = None) -> str:
     url = _clean_instagram_reel_url(url)
     if not INSTAGRAM_RE.match(url):
@@ -54,22 +56,32 @@ def download_audio(url: str, cookies_path: Optional[str] = None) -> str:
 
     tmpdir = tempfile.mkdtemp(prefix="igdl_")
     outtmpl = os.path.join(tmpdir, "%(id)s.%(ext)s")
-    ydl_opts = {
+
+    ydl_opts: Dict[str, Any] = {
         "format": "bestaudio/best",
         "noplaylist": True,
         "outtmpl": outtmpl,
         "quiet": True,
         "nocheckcertificate": True,
-        # These headers can help reduce rate-limiting complaints:
+        # A realistic UA helps reduce some rate-limit checks:
         "http_headers": {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                          "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            )
         },
-        # "sleep_interval": 1.0,  # if you batch many reels, consider small sleeps
-        # "max_sleep_interval": 2.0,
     }
+
+    # 1) If a cookies.txt path was given explicitly, use it.
     if cookies_path and os.path.exists(cookies_path):
         ydl_opts["cookiefile"] = cookies_path
+
+    # 2) Otherwise, if we're running locally and the user set COOKIES_BROWSER,
+    #    let yt-dlp read cookies directly from the local browser profile.
+    elif LOCAL_COOKIES_BROWSER in {"chrome", "edge", "firefox"}:
+        # This is local-only — on cloud hosts it will do nothing unless you set the env var there.
+        ydl_opts["cookiesfrombrowser"] = (LOCAL_COOKIES_BROWSER,)
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -82,13 +94,15 @@ def transcribe(audio_path: str, language: Optional[str], model_size: str, comput
     result_segments = []
     full_text_parts = []
     for seg in segments:
+        text = seg.text.strip()
         result_segments.append({
             "id": seg.id,
             "start": round(seg.start, 2),
             "end": round(seg.end, 2),
-            "text": seg.text.strip()
+            "text": text
         })
-        full_text_parts.append(seg.text.strip())
+        if text:
+            full_text_parts.append(text)
     return {
         "duration": round(getattr(info, "duration", 0.0), 2) if hasattr(info, "duration") else None,
         "language": getattr(info, "language", None) or language,
@@ -107,7 +121,6 @@ def write_srt(segments: List[Dict[str, Any]], out_path: str) -> str:
     return out_path
 
 # ---------- FastAPI ----------
-
 class TranscribeRequest(BaseModel):
     model_config = {"protected_namespaces": ()}
     urls: List[str]
@@ -133,9 +146,9 @@ class TranscribeResult(BaseModel):
 class BatchResponse(BaseModel):
     results: List[TranscribeResult]
 
-app = FastAPI(title="Instagram Reel Transcriber", version="1.2.0")
+app = FastAPI(title="Instagram Reel Transcriber", version="1.3.0")
 
-# --- Minimal web UI (now with cookies upload) ---
+# --- Minimal web UI (no uploads needed) ---
 FORM_HTML = """<!doctype html>
 <html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Reel → Transcript</title>
@@ -143,24 +156,21 @@ FORM_HTML = """<!doctype html>
 body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;max-width:720px;margin:40px auto;padding:0 16px}
 h1{font-size:1.6rem;margin-bottom:0.5rem}
 form{display:grid;gap:12px}
-input,button,textarea{font:inherit;padding:10px;border-radius:10px;border:1px solid #ccc}
+input,button{font:inherit;padding:10px;border-radius:10px;border:1px solid #ccc}
 button{cursor:pointer}
 small{color:#666}
 pre{white-space:pre-wrap;background:#f6f6f6;border-radius:10px;padding:12px}
 </style>
 <h1>Instagram Reel → Transcript</h1>
-<form method="post" action="/submit" enctype="multipart/form-data">
+<form method="post" action="/submit">
   <label>Reel URL
     <input name="url" placeholder="https://www.instagram.com/reel/XXXXXXXX/">
   </label>
   <label>Language (optional)
     <input name="language" placeholder="en, it, ...">
   </label>
-  <label>cookies.txt (optional, for private/rate-limited reels)
-    <input type="file" name="cookies" accept=".txt">
-  </label>
   <button type="submit">Transcribe</button>
-  <small>Only process content you’re allowed to use. Keep cookies local.</small>
+  <small>Only process content you’re allowed to use.</small>
 </form>
 """
 
@@ -168,40 +178,20 @@ pre{white-space:pre-wrap;background:#f6f6f6;border-radius:10px;padding:12px}
 def home():
     return FORM_HTML
 
-# Friendly redirect if someone GETs /submit in the address bar
+# Helpful redirect if someone opens /submit in the address bar
 @app.get("/submit")
 def submit_get_redirect():
     return RedirectResponse(url="/")
 
 @app.post("/submit", response_class=HTMLResponse)
-async def submit(url: str = Form(...),
-                 language: Optional[str] = Form(None),
-                 cookies: Optional[UploadFile] = File(None)):
+def submit(url: str = Form(...), language: Optional[str] = Form(None)):
     try:
-        cookies_path = None
-        tmp_cookies_dir = None
-        if cookies is not None:
-            # Save uploaded cookies to a temp file
-            tmp_cookies_dir = tempfile.mkdtemp(prefix="cookies_")
-            cookies_path = os.path.join(tmp_cookies_dir, "cookies.txt")
-            with open(cookies_path, "wb") as f:
-                f.write(await cookies.read())
-
-        media_path = download_audio(url, cookies_path)
+        media_path = download_audio(url, None)
         data = transcribe(media_path, language, os.environ.get("MODEL_SIZE","small"), os.environ.get("COMPUTE_TYPE","int8"))
         srt_path = os.path.splitext(media_path)[0] + ".srt"
         write_srt(data["segments"], srt_path)
         cleaned = _clean_instagram_reel_url(url)
         transcript = data.get("text","")
-
-        # (Optional) clean up uploaded cookies file
-        if tmp_cookies_dir:
-            try:
-                os.remove(cookies_path)
-                os.rmdir(tmp_cookies_dir)
-            except Exception:
-                pass
-
         return HTMLResponse(
             FORM_HTML + f"<h2>Transcript</h2><pre>{transcript}</pre><p><small>URL: {cleaned}</small></p>"
         )
@@ -230,7 +220,6 @@ def api_transcribe(req: TranscribeRequest):
     return BatchResponse(results=out_results)
 
 # ---------- CLI ----------
-
 def cli():
     parser = argparse.ArgumentParser(description="Instagram Reel -> Transcript")
     parser.add_argument("urls", nargs="*", help="One or more Instagram Reel URLs")
