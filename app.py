@@ -6,8 +6,8 @@ import tempfile
 from typing import List, Optional, Dict, Any
 from urllib.parse import urlsplit, urlunsplit
 
-from fastapi import FastAPI, HTTPException, Form
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, HTTPException, Form, UploadFile, File
+from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 import uvicorn
 import yt_dlp
@@ -60,6 +60,13 @@ def download_audio(url: str, cookies_path: Optional[str] = None) -> str:
         "outtmpl": outtmpl,
         "quiet": True,
         "nocheckcertificate": True,
+        # These headers can help reduce rate-limiting complaints:
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        },
+        # "sleep_interval": 1.0,  # if you batch many reels, consider small sleeps
+        # "max_sleep_interval": 2.0,
     }
     if cookies_path and os.path.exists(cookies_path):
         ydl_opts["cookiefile"] = cookies_path
@@ -126,9 +133,9 @@ class TranscribeResult(BaseModel):
 class BatchResponse(BaseModel):
     results: List[TranscribeResult]
 
-app = FastAPI(title="Instagram Reel Transcriber", version="1.1.0")
+app = FastAPI(title="Instagram Reel Transcriber", version="1.2.0")
 
-# --- Minimal web UI ---
+# --- Minimal web UI (now with cookies upload) ---
 FORM_HTML = """<!doctype html>
 <html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Reel → Transcript</title>
@@ -142,15 +149,18 @@ small{color:#666}
 pre{white-space:pre-wrap;background:#f6f6f6;border-radius:10px;padding:12px}
 </style>
 <h1>Instagram Reel → Transcript</h1>
-<form method="post" action="/submit">
+<form method="post" action="/submit" enctype="multipart/form-data">
   <label>Reel URL
     <input name="url" placeholder="https://www.instagram.com/reel/XXXXXXXX/">
   </label>
   <label>Language (optional)
     <input name="language" placeholder="en, it, ...">
   </label>
+  <label>cookies.txt (optional, for private/rate-limited reels)
+    <input type="file" name="cookies" accept=".txt">
+  </label>
   <button type="submit">Transcribe</button>
-  <small>Only process content you’re allowed to use.</small>
+  <small>Only process content you’re allowed to use. Keep cookies local.</small>
 </form>
 """
 
@@ -158,15 +168,40 @@ pre{white-space:pre-wrap;background:#f6f6f6;border-radius:10px;padding:12px}
 def home():
     return FORM_HTML
 
+# Friendly redirect if someone GETs /submit in the address bar
+@app.get("/submit")
+def submit_get_redirect():
+    return RedirectResponse(url="/")
+
 @app.post("/submit", response_class=HTMLResponse)
-def submit(url: str = Form(...), language: Optional[str] = Form(None)):
+async def submit(url: str = Form(...),
+                 language: Optional[str] = Form(None),
+                 cookies: Optional[UploadFile] = File(None)):
     try:
-        media_path = download_audio(url, None)
+        cookies_path = None
+        tmp_cookies_dir = None
+        if cookies is not None:
+            # Save uploaded cookies to a temp file
+            tmp_cookies_dir = tempfile.mkdtemp(prefix="cookies_")
+            cookies_path = os.path.join(tmp_cookies_dir, "cookies.txt")
+            with open(cookies_path, "wb") as f:
+                f.write(await cookies.read())
+
+        media_path = download_audio(url, cookies_path)
         data = transcribe(media_path, language, os.environ.get("MODEL_SIZE","small"), os.environ.get("COMPUTE_TYPE","int8"))
         srt_path = os.path.splitext(media_path)[0] + ".srt"
         write_srt(data["segments"], srt_path)
         cleaned = _clean_instagram_reel_url(url)
         transcript = data.get("text","")
+
+        # (Optional) clean up uploaded cookies file
+        if tmp_cookies_dir:
+            try:
+                os.remove(cookies_path)
+                os.rmdir(tmp_cookies_dir)
+            except Exception:
+                pass
+
         return HTMLResponse(
             FORM_HTML + f"<h2>Transcript</h2><pre>{transcript}</pre><p><small>URL: {cleaned}</small></p>"
         )
@@ -198,7 +233,6 @@ def api_transcribe(req: TranscribeRequest):
 
 def cli():
     parser = argparse.ArgumentParser(description="Instagram Reel -> Transcript")
-    # Make URLs optional so --serve works without them
     parser.add_argument("urls", nargs="*", help="One or more Instagram Reel URLs")
     parser.add_argument("--language","-l", default=None, help="Force language code (e.g., en, it). Default: auto-detect")
     parser.add_argument("--cookies", default=None, help="Path to cookies.txt for private reels (optional).")
@@ -209,16 +243,13 @@ def cli():
     parser.add_argument("--port", default=8000, type=int)
     args = parser.parse_args()
 
-    # If --serve, start server and exit CLI logic
     if args.serve:
         uvicorn.run("app:app", host=args.host, port=args.port, reload=False)
         return
 
-    # CLI mode requires at least one URL
     if not args.urls:
         parser.error("You must pass at least one URL unless using --serve")
 
-    # CLI flow
     for raw_url in args.urls:
         try:
             print(f"Downloading: {raw_url}")
