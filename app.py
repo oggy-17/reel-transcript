@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import argparse
+import hashlib
+import logging
 import os
 import re
 import tempfile
@@ -13,28 +15,37 @@ import uvicorn
 import yt_dlp
 from faster_whisper import WhisperModel
 
-# ----------------- cookie config -----------------
-# For Render (cloud):
-#  - Use one of these env vars:
-#    COOKIES_FILE=/etc/secrets/cookies.txt      (preferred: Secret File path)
-#    COOKIES_TEXT="<entire cookies.txt content>" (fallback: env var)
-#
-# For local:
-#    COOKIES_BROWSER=chrome|edge|firefox
-#
+# -------------------------------------------------
+# Logging
+# -------------------------------------------------
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+
+# -------------------------------------------------
+# Cookie sources (priority: file → text → browser)
+# -------------------------------------------------
 COOKIES_FILE = os.environ.get("COOKIES_FILE", "").strip()
 COOKIES_TEXT = os.environ.get("COOKIES_TEXT", "")
 LOCAL_COOKIES_BROWSER = os.environ.get("COOKIES_BROWSER", "").strip().lower()
 
-# If COOKIES_TEXT is set, materialize it to a temp file once:
+# If COOKIES_TEXT is provided (e.g., on Render), write it once to a temp file
 _COOKIES_TEXT_FILE = None
 if COOKIES_TEXT:
     _tmp = tempfile.mkdtemp(prefix="cookies_env_")
     _COOKIES_TEXT_FILE = os.path.join(_tmp, "cookies.txt")
     with open(_COOKIES_TEXT_FILE, "w", encoding="utf-8", newline="\n") as f:
         f.write(COOKIES_TEXT)
+    logging.info("Materialized COOKIES_TEXT at %s (len=%d)", _COOKIES_TEXT_FILE, len(COOKIES_TEXT))
 
-# ---------- URL cleaning & validation ----------
+# User-Agent (can override with USER_AGENT env)
+USER_AGENT = os.environ.get("USER_AGENT") or (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+
+# -------------------------------------------------
+# URL cleaning & validation
+# -------------------------------------------------
 INSTAGRAM_RE = re.compile(
     r"^https?://(www\.)?instagram\.com/reels?/[A-Za-z0-9_\-]+/?$",
     re.IGNORECASE,
@@ -56,7 +67,9 @@ def _clean_instagram_reel_url(url: str) -> str:
         raise ValueError("URL does not contain a valid Instagram reel id.")
     return urlunsplit((parsed.scheme or "https", parsed.netloc or "www.instagram.com", cleaned_path, "", ""))
 
-# ---------- Whisper model (lazy) ----------
+# -------------------------------------------------
+# Whisper model (lazy init)
+# -------------------------------------------------
 _MODEL = None
 def get_model(model_size: str = "small", compute_type: str = "int8") -> WhisperModel:
     global _MODEL
@@ -64,21 +77,39 @@ def get_model(model_size: str = "small", compute_type: str = "int8") -> WhisperM
         _MODEL = WhisperModel(model_size, device="cpu", compute_type=compute_type)
     return _MODEL
 
-# ---------- Core functions ----------
+# -------------------------------------------------
+# Cookie resolution & helpers
+# -------------------------------------------------
+def _safe_file_fingerprint(p: str) -> str:
+    try:
+        with open(p, "rb") as f:
+            return hashlib.sha256(f.read(4096)).hexdigest()[:16]
+    except Exception:
+        return "unreadable"
+
 def _resolve_cookiefile(explicit_path: Optional[str]) -> Optional[str]:
-    """Pick the best cookie source based on env/args for this process."""
-    # 1) explicit path from API/CLI
+    # 1) Explicit per-call override
     if explicit_path and os.path.exists(explicit_path):
+        logging.info("Using explicit cookies file: %s (fp=%s)", explicit_path, _safe_file_fingerprint(explicit_path))
         return explicit_path
-    # 2) COOKIES_FILE (Render Secret File)
+    # 2) Secret File on Render (or any path via env)
     if COOKIES_FILE and os.path.exists(COOKIES_FILE):
+        logging.info("Using COOKIES_FILE: %s (fp=%s)", COOKIES_FILE, _safe_file_fingerprint(COOKIES_FILE))
         return COOKIES_FILE
-    # 3) COOKIES_TEXT materialized
+    # 3) Raw text from env materialized
     if _COOKIES_TEXT_FILE and os.path.exists(_COOKIES_TEXT_FILE):
+        logging.info("Using COOKIES_TEXT materialized at: %s (fp=%s)", _COOKIES_TEXT_FILE, _safe_file_fingerprint(_COOKIES_TEXT_FILE))
         return _COOKIES_TEXT_FILE
-    # 4) no file; maybe we'll use cookiesfrombrowser locally
+    # 4) Local-only cookiesfrombrowser
+    if LOCAL_COOKIES_BROWSER in {"chrome", "edge", "firefox"}:
+        logging.info("Using cookiesfrombrowser: %s", LOCAL_COOKIES_BROWSER)
+        return None
+    logging.info("No cookies supplied; proceeding anonymous")
     return None
 
+# -------------------------------------------------
+# Core functions
+# -------------------------------------------------
 def download_audio(url: str, cookies_path: Optional[str] = None) -> str:
     url = _clean_instagram_reel_url(url)
     if not INSTAGRAM_RE.match(url):
@@ -94,20 +125,17 @@ def download_audio(url: str, cookies_path: Optional[str] = None) -> str:
         "quiet": True,
         "nocheckcertificate": True,
         "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            )
+            "User-Agent": USER_AGENT,
+            "Referer": "https://www.instagram.com/",
+            "Accept-Language": "en-US,en;q=0.9",
         },
     }
 
     cookiefile = _resolve_cookiefile(cookies_path)
-
     if cookiefile:
         ydl_opts["cookiefile"] = cookiefile
     elif LOCAL_COOKIES_BROWSER in {"chrome", "edge", "firefox"}:
-        # Only works on your local machine; on cloud this does nothing.
+        # Works on your local machine only
         ydl_opts["cookiesfrombrowser"] = (LOCAL_COOKIES_BROWSER,)
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -147,12 +175,14 @@ def write_srt(segments: List[Dict[str, Any]], out_path: str) -> str:
             f.write(f"{i}\n{fmt(seg['start'])} --> {fmt(seg['end'])}\n{seg['text']}\n\n")
     return out_path
 
-# ---------- FastAPI ----------
+# -------------------------------------------------
+# FastAPI models & app
+# -------------------------------------------------
 class TranscribeRequest(BaseModel):
     model_config = {"protected_namespaces": ()}
     urls: List[str]
     language: Optional[str] = Field(default=None)
-    cookies_path: Optional[str] = Field(default=None)  # optional override
+    cookies_path: Optional[str] = Field(default=None)  # optional per-call override
     model_size: str = Field(default=os.environ.get("MODEL_SIZE", "small"))
     compute_type: str = Field(default=os.environ.get("COMPUTE_TYPE", "int8"))
 
@@ -173,7 +203,7 @@ class TranscribeResult(BaseModel):
 class BatchResponse(BaseModel):
     results: List[TranscribeResult]
 
-app = FastAPI(title="Instagram Reel Transcriber", version="1.4.0")
+app = FastAPI(title="Instagram Reel Transcriber", version="1.5.0")
 
 FORM_HTML = """<!doctype html>
 <html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -204,9 +234,23 @@ pre{white-space:pre-wrap;background:#f6f6f6;border-radius:10px;padding:12px}
 def home():
     return FORM_HTML
 
+# Friendly redirect if someone GETs /submit
 @app.get("/submit")
 def submit_get_redirect():
     return RedirectResponse(url="/")
+
+# Diagnostic endpoint to verify cookie source on Render
+@app.get("/diag", response_class=HTMLResponse)
+def diag():
+    p = _resolve_cookiefile(None)
+    exists = (p and os.path.exists(p))
+    size = os.path.getsize(p) if exists else 0
+    return HTMLResponse(
+        f"<pre>COOKIES_FILE={COOKIES_FILE!r}\n"
+        f"COOKIES_TEXT={'set' if COOKIES_TEXT else 'not set'}\n"
+        f"LOCAL_COOKIES_BROWSER={LOCAL_COOKIES_BROWSER!r}\n"
+        f"resolved_cookiefile={p!r}\nexists={exists} size={size}\n</pre>"
+    )
 
 @app.post("/submit", response_class=HTMLResponse)
 def submit(url: str = Form(...), language: Optional[str] = Form(None)):
@@ -244,7 +288,9 @@ def api_transcribe(req: TranscribeRequest):
             raise HTTPException(status_code=400, detail=f"Failed for {raw_url}: {e}")
     return BatchResponse(results=out_results)
 
-# ---------- CLI ----------
+# -------------------------------------------------
+# CLI
+# -------------------------------------------------
 def cli():
     parser = argparse.ArgumentParser(description="Instagram Reel -> Transcript")
     parser.add_argument("urls", nargs="*", help="One or more Instagram Reel URLs")
