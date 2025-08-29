@@ -7,7 +7,7 @@ from typing import List, Optional, Dict, Any
 from urllib.parse import urlsplit, urlunsplit
 
 from fastapi import FastAPI, HTTPException, Form
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 import uvicorn
 import yt_dlp
@@ -110,11 +110,18 @@ class TranscribeRequest(BaseModel):
     compute_type: str = Field(default=os.environ.get("COMPUTE_TYPE", "int8"))
 
 class Segment(BaseModel):
-    id: int; start: float; end: float; text: str
+    id: int
+    start: float
+    end: float
+    text: str
 
 class TranscribeResult(BaseModel):
-    url: str; duration: Optional[float]; language: Optional[str]
-    text: str; segments: List[Segment]; srt_path: Optional[str] = None
+    url: str
+    duration: Optional[float]
+    language: Optional[str]
+    text: str
+    segments: List[Segment]
+    srt_path: Optional[str] = None
 
 class BatchResponse(BaseModel):
     results: List[TranscribeResult]
@@ -191,20 +198,27 @@ def api_transcribe(req: TranscribeRequest):
 
 def cli():
     parser = argparse.ArgumentParser(description="Instagram Reel -> Transcript")
-    parser.add_argument("urls", nargs="+")
-    parser.add_argument("--language","-l", default=None)
-    parser.add_argument("--cookies", default=None)
-    parser.add_argument("--model-size", default=os.environ.get("MODEL_SIZE","small"))
-    parser.add_argument("--compute-type", default=os.environ.get("COMPUTE_TYPE","int8"))
-    parser.add_argument("--serve", action="store_true")
+    # Make URLs optional so --serve works without them
+    parser.add_argument("urls", nargs="*", help="One or more Instagram Reel URLs")
+    parser.add_argument("--language","-l", default=None, help="Force language code (e.g., en, it). Default: auto-detect")
+    parser.add_argument("--cookies", default=None, help="Path to cookies.txt for private reels (optional).")
+    parser.add_argument("--model-size", default=os.environ.get("MODEL_SIZE","small"), help="Whisper model size (tiny/base/small/medium/large-v3)")
+    parser.add_argument("--compute-type", default=os.environ.get("COMPUTE_TYPE","int8"), help="Compute type (int8/int8_float16/float16/float32)")
+    parser.add_argument("--serve", action="store_true", help="Run the API/web server instead of the CLI")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", default=8000, type=int)
     args = parser.parse_args()
 
+    # If --serve, start server and exit CLI logic
     if args.serve:
         uvicorn.run("app:app", host=args.host, port=args.port, reload=False)
         return
 
+    # CLI mode requires at least one URL
+    if not args.urls:
+        parser.error("You must pass at least one URL unless using --serve")
+
+    # CLI flow
     for raw_url in args.urls:
         try:
             print(f"Downloading: {raw_url}")
