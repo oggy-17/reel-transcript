@@ -13,10 +13,26 @@ import uvicorn
 import yt_dlp
 from faster_whisper import WhisperModel
 
-# ----------------- config -----------------
-# Set this env var locally to auto-use your browser cookies (no uploads needed):
-#   COOKIES_BROWSER=chrome  (or edge / firefox)
+# ----------------- cookie config -----------------
+# For Render (cloud):
+#  - Use one of these env vars:
+#    COOKIES_FILE=/etc/secrets/cookies.txt      (preferred: Secret File path)
+#    COOKIES_TEXT="<entire cookies.txt content>" (fallback: env var)
+#
+# For local:
+#    COOKIES_BROWSER=chrome|edge|firefox
+#
+COOKIES_FILE = os.environ.get("COOKIES_FILE", "").strip()
+COOKIES_TEXT = os.environ.get("COOKIES_TEXT", "")
 LOCAL_COOKIES_BROWSER = os.environ.get("COOKIES_BROWSER", "").strip().lower()
+
+# If COOKIES_TEXT is set, materialize it to a temp file once:
+_COOKIES_TEXT_FILE = None
+if COOKIES_TEXT:
+    _tmp = tempfile.mkdtemp(prefix="cookies_env_")
+    _COOKIES_TEXT_FILE = os.path.join(_tmp, "cookies.txt")
+    with open(_COOKIES_TEXT_FILE, "w", encoding="utf-8", newline="\n") as f:
+        f.write(COOKIES_TEXT)
 
 # ---------- URL cleaning & validation ----------
 INSTAGRAM_RE = re.compile(
@@ -49,6 +65,20 @@ def get_model(model_size: str = "small", compute_type: str = "int8") -> WhisperM
     return _MODEL
 
 # ---------- Core functions ----------
+def _resolve_cookiefile(explicit_path: Optional[str]) -> Optional[str]:
+    """Pick the best cookie source based on env/args for this process."""
+    # 1) explicit path from API/CLI
+    if explicit_path and os.path.exists(explicit_path):
+        return explicit_path
+    # 2) COOKIES_FILE (Render Secret File)
+    if COOKIES_FILE and os.path.exists(COOKIES_FILE):
+        return COOKIES_FILE
+    # 3) COOKIES_TEXT materialized
+    if _COOKIES_TEXT_FILE and os.path.exists(_COOKIES_TEXT_FILE):
+        return _COOKIES_TEXT_FILE
+    # 4) no file; maybe we'll use cookiesfrombrowser locally
+    return None
+
 def download_audio(url: str, cookies_path: Optional[str] = None) -> str:
     url = _clean_instagram_reel_url(url)
     if not INSTAGRAM_RE.match(url):
@@ -63,7 +93,6 @@ def download_audio(url: str, cookies_path: Optional[str] = None) -> str:
         "outtmpl": outtmpl,
         "quiet": True,
         "nocheckcertificate": True,
-        # A realistic UA helps reduce some rate-limit checks:
         "http_headers": {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -73,14 +102,12 @@ def download_audio(url: str, cookies_path: Optional[str] = None) -> str:
         },
     }
 
-    # 1) If a cookies.txt path was given explicitly, use it.
-    if cookies_path and os.path.exists(cookies_path):
-        ydl_opts["cookiefile"] = cookies_path
+    cookiefile = _resolve_cookiefile(cookies_path)
 
-    # 2) Otherwise, if we're running locally and the user set COOKIES_BROWSER,
-    #    let yt-dlp read cookies directly from the local browser profile.
+    if cookiefile:
+        ydl_opts["cookiefile"] = cookiefile
     elif LOCAL_COOKIES_BROWSER in {"chrome", "edge", "firefox"}:
-        # This is local-only — on cloud hosts it will do nothing unless you set the env var there.
+        # Only works on your local machine; on cloud this does nothing.
         ydl_opts["cookiesfrombrowser"] = (LOCAL_COOKIES_BROWSER,)
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -125,7 +152,7 @@ class TranscribeRequest(BaseModel):
     model_config = {"protected_namespaces": ()}
     urls: List[str]
     language: Optional[str] = Field(default=None)
-    cookies_path: Optional[str] = Field(default=None)
+    cookies_path: Optional[str] = Field(default=None)  # optional override
     model_size: str = Field(default=os.environ.get("MODEL_SIZE", "small"))
     compute_type: str = Field(default=os.environ.get("COMPUTE_TYPE", "int8"))
 
@@ -146,9 +173,8 @@ class TranscribeResult(BaseModel):
 class BatchResponse(BaseModel):
     results: List[TranscribeResult]
 
-app = FastAPI(title="Instagram Reel Transcriber", version="1.3.0")
+app = FastAPI(title="Instagram Reel Transcriber", version="1.4.0")
 
-# --- Minimal web UI (no uploads needed) ---
 FORM_HTML = """<!doctype html>
 <html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Reel → Transcript</title>
@@ -178,7 +204,6 @@ pre{white-space:pre-wrap;background:#f6f6f6;border-radius:10px;padding:12px}
 def home():
     return FORM_HTML
 
-# Helpful redirect if someone opens /submit in the address bar
 @app.get("/submit")
 def submit_get_redirect():
     return RedirectResponse(url="/")
